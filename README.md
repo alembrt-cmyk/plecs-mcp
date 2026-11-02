@@ -26,7 +26,7 @@ AI Agent（Claude Code、GitHub Copilot 等）可以直接操作 PLECS 模型、
 ### 2. 安装
 
 ```bash
-git clone https://github.com/Traeai/plecs-mcp.git
+git clone https://github.com/alembrt-cmyk/plecs-mcp.git
 cd plecs-mcp
 pip install -e .
 ```
