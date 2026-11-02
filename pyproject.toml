@@ -1,0 +1,22 @@
+[build-system]
+requires      = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name            = "plecs-mcp"
+version         = "0.3.0"
+description     = "MCP Server for PLECS 4.7 Standalone"
+requires-python = ">=3.10"
+dependencies    = [
+    "mcp[cli]>=1.6.0,<2",   # 2.x 把 FastMCP 改名 MCPServer 且 API 变动，本项目用 1.x
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "pytest-mock>=3.0"]
+
+[project.scripts]
+plecs-mcp = "server:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
