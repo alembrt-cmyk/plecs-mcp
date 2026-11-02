@@ -21,6 +21,15 @@ MCP tool 与 PLECS XML-RPC 接口一一对应（官方手册《Simulation Script
     plecs_webserver → plecs.webserver
     plecs_codegen   → plecs.codegen
 
+以下 5 个是**离线**工具（解析磁盘文件，不需要 PLECS 在运行）——
+RPC 没有「列组件 / 列端口 / 改磁盘模型」接口，这些只能离线做：
+
+    plecs_trace_read   → 解析 .trace（Scope SaveTraces 的产物）→ 统计量 / CSV
+    plecs_file_info    → .plecs 概览（求解器、时长、组件统计、树、InitCommands）
+    plecs_file_blocks  → 列组件（按名称/类型筛）+ 端口表
+    plecs_file_get     → 读某块参数（C-Script 的 Declarations/Ts/Parameters…）
+    plecs_file_set     → 改 .plecs 参数并写盘（自动备份 + 回读校验）
+
 启动方式（通常由 AI Agent 自动启动，无需手动运行）：
     python server.py                   # stdio 模式
     python server.py --transport sse   # SSE 模式（远程 Agent）
@@ -31,12 +40,15 @@ import sys
 import re
 import json
 import math
+import time
 import argparse
 import logging
 
 import yaml
 from mcp.server.fastmcp import FastMCP
 from plecs_client import PlecsClient, PlecsError
+import trace_reader as _tr
+import plecs_file as _pf
 
 logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
@@ -63,7 +75,35 @@ def load_config() -> dict:
 
 # ── 结果格式化 ────────────────────────────────────────────────────────────
 
+def _save_mat(data: bytes, target: str, model_name: str) -> str:
+    """OutputFormat=MatFile 的返回值落盘。
+
+    实测 4.7.5：PLECS **不写文件**，把 MAT 二进制当 RPC 返回值直接吐回来
+    （首字节起 "Binary MATLAB 5.0 MAT-file, written by PLECS ..."）。
+    """
+    path = target or os.path.join(os.getcwd(), f"{model_name}_result.mat")
+    d = os.path.dirname(os.path.abspath(path))
+    try:
+        os.makedirs(d, exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(data)
+    except OSError as e:
+        return (f"✗ 仿真已有结果（{len(data):,} 字节 MAT），但写盘失败：{e}\n"
+                f"  可换一个 save_mat 路径重跑，或用 OutputFormat=\"Plain\"")
+    return (
+        f"✓ 仿真完成（MatFile 输出）\n"
+        f"  已写盘：{path}\n"
+        f"  大小：{len(data):,} 字节（全精度时序，可用 scipy.io.loadmat 读取）\n"
+        f"  说明：PLECS 本身不落盘，MAT 数据是作为 RPC 返回值传回的，本工具代写。"
+    )
+
+
 def _fmt_models(models: list) -> str:
+    """渲染 statistics().models。
+
+    4.7.5 实测条目 = {id, filename, library, state, age}，无 simulating 键；
+    仿真中 state=="simulation running"（client 已派生 simulating）。
+    """
     if not models:
         return "    （无）"
     lines = []
@@ -73,12 +113,17 @@ def _fmt_models(models: list) -> str:
             tags = []
             if m.get("library"):
                 tags.append("库")
-            if m.get("simulating"):
+            state = str(m.get("state", "") or "")
+            if m.get("simulating") or "running" in state.lower():
                 tags.append("仿真中")
+            elif state and state.lower() != "idle":
+                tags.append(state)
+            fn = str(m.get("filename", "") or "")
+            suffix = f"  — {fn}" if (fn and not m.get("library")) else ""
         else:
-            mid, tags = str(m), []
+            mid, tags, suffix = str(m), [], ""
         tag_str = f"  [{','.join(tags)}]" if tags else ""
-        lines.append(f"    • {mid}{tag_str}")
+        lines.append(f"    • {mid}{tag_str}{suffix}")
     return "\n".join(lines)
 
 
@@ -140,22 +185,48 @@ def _fmt_sim(result, model_vars=None) -> str:
 
 
 def _to_complex_rows(Gr, Gi, n_f):
-    """Gr/Gi → (mag_dB, phase_deg) 逐频率。兼容 1D（SISO）与 2D（取第 1 行）。"""
-    def flat(x):
+    """Gr/Gi → [(mag_dB, phase_deg), ...]，每个输出一行（MIMO 不再丢通道）。
+
+    兼容 1D（SISO → 单行）与 2D（多输出 → 逐行）。
+    """
+    def rows(x):
         if not x:
             return []
         if isinstance(x[0], (list, tuple)):
-            return [float(v) for v in x[0]]   # 多输出时取第 1 行
-        return [float(v) for v in x]
+            return [[float(v) for v in r] for r in x]
+        return [[float(v) for v in x]]
 
-    gr, gi = flat(Gr), flat(Gi)
-    n = min(len(gr), len(gi), n_f or max(len(gr), len(gi)))
-    mag, phase = [], []
-    for k in range(n):
-        g = complex(gr[k], gi[k])
-        mag.append(20.0 * math.log10(abs(g)) if abs(g) > 0 else -999.0)
-        phase.append(math.degrees(math.atan2(g.imag, g.real)))
-    return mag, phase
+    grs, gis = rows(Gr), rows(Gi)
+    if not grs or not gis:
+        return []
+    out = []
+    for k in range(min(len(grs), len(gis))):
+        g_r, g_i = grs[k], gis[k]
+        n = min(len(g_r), len(g_i))
+        if n_f:
+            n = min(n, n_f)
+        mag, phase = [], []
+        for j in range(n):
+            g = complex(g_r[j], g_i[j])
+            mag.append(20.0 * math.log10(abs(g)) if abs(g) > 0 else -999.0)
+            phase.append(math.degrees(math.atan2(g.imag, g.real)))
+        out.append((mag, phase))
+    return out
+
+
+def _crossing(mag, phase, F):
+    """0dB 穿越频率与相位裕度；无穿越返回 (None, None)。"""
+    if not mag or len(mag) != len(F):
+        return None, None
+    for i in range(len(mag) - 1):
+        if mag[i] >= 0 > mag[i + 1]:
+            r = -mag[i] / (mag[i + 1] - mag[i])
+            fc = F[i] + r * (F[i + 1] - F[i])
+            pm = None
+            if phase and len(phase) == len(F):
+                pm = 180 + (phase[i] + r * (phase[i + 1] - phase[i]))
+            return fc, pm
+    return None, None
 
 
 def _fmt_analyze(result, analysis_name: str) -> str:
@@ -165,49 +236,49 @@ def _fmt_analyze(result, analysis_name: str) -> str:
     # 归一化：优先官方 {F, Gr, Gi}；兼容旧 {Frequencies, Magnitude, Phase}
     F = result.get("F")
     if F is not None:
-        mag, phase = _to_complex_rows(result.get("Gr"), result.get("Gi"), len(F))
         F = [float(v) for v in F]
+        rows = _to_complex_rows(result.get("Gr"), result.get("Gi"), len(F))
     else:
-        F = result.get("Frequencies", result.get("Frequency")) or []
-        F = [float(v) for v in F]
+        F = [float(v) for v in (result.get("Frequencies", result.get("Frequency")) or [])]
         mag = [float(v) for v in (result.get("Magnitude") or [])]
         phase = [float(v) for v in (result.get("Phase") or [])]
+        rows = [(mag, phase)] if (mag or phase) else []
 
-    if F and (mag or result.get("Gr") is not None or result.get("Magnitude") is not None):
+    if F and rows:
         lines = [
             f"✓ {analysis_name} 完成（小信号）",
             f"  频率范围：{F[0]:.4g} Hz → {F[-1]:.4g} Hz（{len(F)} 点）",
+            f"  输出通道：{len(rows)} 个",
         ]
-        if mag:
-            lines.append(f"  幅值范围：{min(mag):.2f} dB → {max(mag):.2f} dB")
-        if phase:
-            lines.append(f"  相位范围：{min(phase):.1f}° → {max(phase):.1f}°")
 
-        # 穿越频率 / 相位裕度
-        if mag and len(mag) == len(F):
-            for i in range(len(mag) - 1):
-                if mag[i] >= 0 > mag[i + 1]:
-                    r = -mag[i] / (mag[i + 1] - mag[i])
-                    fc = F[i] + r * (F[i + 1] - F[i])
-                    lines.append(f"\n  穿越频率（0dB）：{fc:.2f} Hz")
-                    if phase and len(phase) == len(F):
-                        pm = 180 + (phase[i] + r * (phase[i + 1] - phase[i]))
-                        verdict = ("✓ 良好(≥45°)" if pm >= 45
-                                   else "⚠ 偏低(<45°)" if pm >= 30
-                                   else "✗ 不足(<30°，系统接近不稳定)")
-                        lines.append(f"  相位裕度：{pm:.1f}°  {verdict}")
-                    break
+        # 逐通道算穿越频率 / 相位裕度（MIMO 全部列出）
+        for k, (mag, phase) in enumerate(rows):
+            prefix = f"  [通道 {k+1}] " if len(rows) > 1 else "  "
+            if mag:
+                lines.append(f"{prefix}幅值范围：{min(mag):.2f} → {max(mag):.2f} dB")
+            fc, pm = _crossing(mag, phase, F)
+            if fc is not None:
+                head = f"{prefix}穿越频率（0dB）：{fc:.2f} Hz"
+                if pm is not None:
+                    verdict = ("✓ 良好(≥45°)" if pm >= 45
+                               else "⚠ 偏低(<45°)" if pm >= 30
+                               else "✗ 不足(<30°，系统接近不稳定)")
+                    head += f"，相位裕度：{pm:.1f}°  {verdict}"
+                lines.append(head)
             else:
-                lines.append("\n  （扫频范围内未发现 0dB 穿越点）")
+                lines.append(f"{prefix}（扫频范围内未发现 0dB 穿越点）")
 
+        mag0, ph0 = rows[0]
         lines.append(f"\n  {'频率(Hz)':>12}  {'幅值(dB)':>10}  {'相位(°)':>10}")
         lines.append("  " + "─" * 38)
         for i in range(min(10, len(F))):
-            mg_s = f"{mag[i]:>10.2f}" if i < len(mag) else "       N/A"
-            ph_s = f"{phase[i]:>10.1f}" if i < len(phase) else "       N/A"
+            mg_s = f"{mag0[i]:>10.2f}" if i < len(mag0) else "       N/A"
+            ph_s = f"{ph0[i]:>10.1f}" if i < len(ph0) else "       N/A"
             lines.append(f"  {F[i]:>12.4g}  {mg_s}  {ph_s}")
         if len(F) > 10:
             lines.append(f"  ...（共 {len(F)} 点）")
+        if len(rows) > 1:
+            lines.append(f"  （上表仅通道 1，共 {len(rows)} 个通道）")
         return "\n".join(lines)
 
     # 稳态等：{Time, Values}
@@ -264,15 +335,25 @@ PLECS 4.7.x 仿真控制 MCP Server（与官方 RPC 手册一一对应）。
   2. plecs_load     — 打开模型，拿到 model_name
   3. plecs_get / plecs_set / plecs_get_init / plecs_set_init_var — 读写参数（可选）
   4. plecs_simulate / plecs_analyze — 运行仿真或分析（阻塞命令）
-  5. plecs_scope    — SaveTraces 存 .trace（顶层无 Outport 时的取数正路；
-                       定量 CSV 在 GUI 导出）
-  6. plecs_close    — 完成后关闭模型（仿真运行中会拒绝）
+  5. plecs_scope    — SaveTraces 存 .trace（顶层无 Outport 时的取数正路）
+  6. plecs_trace_read — 解析 .trace 出数值统计 / CSV（离线，不需要连接）
+  7. plecs_close    — 完成后关闭模型（仿真运行中会拒绝）
+
+离线工具（不需要 PLECS 在运行，直接读磁盘）：
+  - plecs_trace_read / plecs_file_info / plecs_file_blocks /
+    plecs_file_get / plecs_file_set
+  - 「列组件 / 列端口」只能靠 plecs_file_blocks：RPC 没有组件树接口
+  - 「改磁盘 .plecs」只能靠 plecs_file_set：plecs_set 只改内存模型
 
 关键事实（4.7.x 实测）：
   - 仿真时长写 SolverOpts.TimeSpan（秒）；StopTime 已废弃
   - simulate 阻塞且仅当模型顶层有 Outport 才返回 {Time, Values}
-  - statistics().models 每项是 {id, library, simulating}
-  - 仿真运行中绝不可 close
+  - OutputFormat="MatFile" 不会落盘：PLECS 把 MAT 二进制当返回值传回，
+    plecs_simulate(save_mat=...) 代写文件（要全精度时序就靠它）
+  - statistics().models 每项是 {id, filename, library, state, age}，
+    仿真中 state="simulation running"（无 simulating 键，工具已派生）
+  - plecs.load 成功返回 0，真实模型名由工具从 statistics 反查
+  - 仿真运行中绝不可 close；RPC 无 abort，超时后仿真可能仍在跑（先 plecs_status）
   - 改 InitializationCommands 是在内存模型上生效（不会改磁盘 .plecs）
 
 前置条件：PLECS Standalone 已启动，
@@ -412,15 +493,19 @@ Preferences → Simulation → "Start XML-RPC server" 已勾选（端口 1080）
             if not force:
                 try:
                     stats = client().statistics()
-                    busy = [
-                        (m.get("id") if isinstance(m, dict) else str(m))
-                        for m in stats.get("models", [])
-                        if isinstance(m, dict) and m.get("simulating")
-                    ]
+                    busy = {}
+                    for m in stats.get("models", []):
+                        if not isinstance(m, dict):
+                            continue
+                        # 4.7.5 实测：无 simulating 键，状态在 state（"simulation running"/"idle"）
+                        state = str(m.get("state", "") or "")
+                        if m.get("simulating") or "running" in state.lower():
+                            busy[str(m.get("id"))] = state or "simulation running"
                     if model_name in busy:
                         return (
-                            f"✗ 拒绝关闭 \"{model_name}\"：该模型正在仿真运行中。\n"
-                            f"  请等仿真结束（或确认丢弃结果后用 force=true 强关）。"
+                            f"✗ 拒绝关闭 \"{model_name}\"：该模型正在仿真运行中（state={busy[model_name]}）。\n"
+                            f"  注意 RPC 没有 abort 接口，只能等它跑完或手动在 GUI 里停。\n"
+                            f"  确认丢弃结果后才用 force=true 强关。"
                         )
                 except PlecsError:
                     pass  # 查不到状态时不阻塞关闭
@@ -492,7 +577,7 @@ Preferences → Simulation → "Start XML-RPC server" 已勾选（端口 1080）
     # ── plecs_simulate ────────────────────────────────────────────────────
 
     @mcp.tool()
-    def plecs_simulate(model_name: str, opts: str = "{}") -> str:
+    def plecs_simulate(model_name: str, opts: str = "{}", save_mat: str = "") -> str:
         """
         调用 plecs.simulate(modelName[, optStruct]) 运行时域仿真。**阻塞**直到仿真结束。
 
@@ -518,9 +603,14 @@ Preferences → Simulation → "Start XML-RPC server" 已勾选（端口 1080）
                 完整示例：
                 '{"ModelVars": {"Vin": 48}, "TimeSpan": 0.005}'
 
+            save_mat: 仅当 opts 里 OutputFormat="MatFile" 时有效。
+                      **PLECS 不会自己写文件**，它把 MAT 二进制当 RPC 返回值吐回来；
+                      本工具代写到该路径（留空则写 <当前目录>/<模型名>_result.mat）。
+
         Returns:
             顶层有 Outport → 各通道 min/max/avg/pp/rms 统计；
-            顶层无 Outport → 不返回数值（官方行为），提示改用 plecs_scope 导出波形。
+            OutputFormat=MatFile → 落盘 .mat 并回报路径与字节数（全精度时序）；
+            顶层无 Outport 且非 MatFile → 不返回数值（官方行为），提示走 plecs_scope。
         """
         try:
             raw = json.loads(opts)
@@ -540,7 +630,10 @@ Preferences → Simulation → "Start XML-RPC server" 已勾选（端口 1080）
                     parts.append("  ⚠ " + "；".join(dict.fromkeys(warns)))
                 for i, r in enumerate(result):
                     name = raw[i].get("Name", f"#{i+1}") if isinstance(raw[i], dict) else f"#{i+1}"
-                    if isinstance(r, str):
+                    if isinstance(r, dict) and r.get("_binary"):
+                        parts.append(f"\n── {name}：MatFile 输出 {len(r['_binary']):,} 字节"
+                                     f"（批量模式不落盘，请逐条单独跑以指定 save_mat）")
+                    elif isinstance(r, str):
                         parts.append(f"\n── {name}：✗ 错误：{r}")
                     elif isinstance(r, dict) and r.get("Time"):
                         parts.append(f"\n── {name}：" + _fmt_sim(r).split("\n", 1)[-1])
@@ -553,7 +646,10 @@ Preferences → Simulation → "Start XML-RPC server" 已勾选（端口 1080）
         except PlecsError as e:
             return f"✗ 仿真失败：{e}"
 
-        out = _fmt_sim(result, (raw or {}).get("ModelVars"))
+        if isinstance(result, dict) and result.get("_binary"):
+            out = _save_mat(result["_binary"], save_mat, model_name)
+        else:
+            out = _fmt_sim(result, (raw or {}).get("ModelVars"))
         if warns:
             out = "  ⚠ " + "；".join(dict.fromkeys(warns)) + "\n" + out
         return out
@@ -622,7 +718,12 @@ Preferences → Simulation → "Start XML-RPC server" 已勾选（端口 1080）
         except PlecsError as e:
             return f"✗ 分析失败：{e}"
 
-        out = _fmt_analyze(result, analysis_type)
+        if isinstance(result, dict) and result.get("_binary"):
+            out = (f"✓ {analysis_type} 完成，但返回的是 MAT 二进制（{len(result['_binary']):,} 字节），"
+                   f"本工具不落盘。\n"
+                   f"  改法：去掉 opts 里的 OutputFormat=MatFile，用默认 Plain 取 F/Gr/Gi。")
+        else:
+            out = _fmt_analyze(result, analysis_type)
         if compat:
             out = "  ⚠ 旧键名映射：" + "；".join(compat) + "\n" + out
         return out
@@ -647,8 +748,9 @@ Preferences → Simulation → "Start XML-RPC server" 已勾选（端口 1080）
                         "LoadTraces"     从 .trace 载入轨迹（args '["绝对路径.trace"]'）
 
                         注：ExportCSV / ExportBitmap / GetCursorData 在 4.7.5 RPC
-                        上不可用（报 Invalid scope command）；定量数据请在 PLECS
-                        GUI 中导出 CSV，或 SaveTraces 后用离线工具解析 .trace。
+                        上不可用（报 Invalid scope command）；定量数据用
+                        SaveTraces 存 .trace 后交给 plecs_trace_read 解析
+                        （可导 CSV），或 SaveTraces → LoadTraces 回看波形。
 
             args: JSON 数组字符串，按顺序传给 command 的额外参数。默认 "[]"。
 
@@ -832,6 +934,284 @@ Preferences → Simulation → "Start XML-RPC server" 已勾选（端口 1080）
         if not result:
             return f"✓ codegen 完成：{model_name}"
         return f"✓ codegen 完成：{model_name}\n{json.dumps(result, ensure_ascii=False, indent=2)}"
+
+    # ── plecs_trace_read（离线，不需要 PLECS 在运行）──────────────────────
+
+    @mcp.tool()
+    def plecs_trace_read(trace_path: str, save_csv: str = "", head: int = 0,
+                         max_curves: int = 0, keep: bool = True) -> str:
+        """
+        解析 `.trace` 波形文件，给出逐曲线统计，可选导出 CSV。
+        **纯离线**（读文件，不连 PLECS），是「顶层无 Outport 模型」的定量取数正路。
+
+        典型链路：plecs_simulate(Plain/MatFile) 跑完后
+          → plecs_scope(scope_path, "SaveTraces", '["D:/x.trace"]')
+          → plecs_trace_read("D:/x.trace", save_csv="D:/x.csv")
+
+        Args:
+            trace_path: .trace 文件绝对路径
+            save_csv:   留空不写；给 .csv 路径则写该文件；给目录则写
+                        `<目录>/<trace 名>.csv`。同时间基写宽表（首列 t），
+                        否则每条曲线两列（t,v）。
+            head:       >0 时在文本里附前 N 点样本（默认 0，只给统计量）
+            max_curves: >0 时只解析前 N 条曲线
+            keep:       False 不保留数组，只流式算统计量（>100 MB 文件必用；
+                        此时不能导 CSV）
+
+        Returns:
+            逐曲线：时间范围、dt、min/max/avg/pp/rms；CSV 落盘路径。
+        """
+        p = os.path.abspath(os.path.expanduser(trace_path))
+        if not os.path.exists(p):
+            return (f"✗ 文件不存在：{p}\n"
+                    f"  先用 plecs_scope(scope_path, \"SaveTraces\", '[\"{p}\"]') 生成")
+        size = os.path.getsize(p)
+        note = ""
+        if keep and size > 80 * 1024 * 1024:
+            keep = False
+            note = (f"\n  ⚠ 文件 {size / 1048576:.0f} MB，已自动切到统计模式（不保留数组）；"
+                    f"要全量数组请显式传 keep=True 并注意内存\n")
+
+        t0 = time.time()
+        try:
+            curves = _tr.read_trace(p, max_curves=max_curves, keep=keep)
+        except _tr.TraceError as e:
+            return (f"✗ .trace 解析失败：{e}\n"
+                    f"  文件：{p}（{size} 字节）\n"
+                    f"  提示：本解析器按 PLECS 4.7.5 的 v2 格式实现；"
+                    f"若该文件来自别的版本，用 GUI 导出 CSV 更稳")
+        except Exception as e:                                  # noqa: BLE001
+            return f"✗ 解析异常：{type(e).__name__}: {e}"
+        dt = time.time() - t0
+
+        body = _tr.summarize(curves, head=head)
+        out = [f"✓ {os.path.basename(p)}（{size / 1024:.1f} KB，解析 {dt:.2f}s）", body]
+        if note:
+            out.append(note.rstrip())
+
+        if save_csv:
+            if not keep:
+                out.append("  ⚠ 统计模式未保留数组，已跳过 CSV 导出（需要 CSV 请 keep=True）")
+            else:
+                target = save_csv
+                if os.path.isdir(target):
+                    target = os.path.join(target, os.path.splitext(os.path.basename(p))[0] + ".csv")
+                try:
+                    written = _tr.write_csv(target, curves)
+                    nrow = len(curves[0].t) if curves and curves[0].t else 0
+                    out.append(f"  ✓ CSV 已写盘：{written}（{nrow} 行 × {len(curves) + 1} 列）")
+                except OSError as e:
+                    out.append(f"  ✗ CSV 写盘失败：{e}")
+        return "\n".join(out)
+
+    # ── plecs_file_info / blocks / get / set（离线改 .plecs）───────────────
+
+    def _open_plecs(path: str) -> _pf.PlecsFile:
+        p = os.path.abspath(os.path.expanduser(path))
+        if not os.path.exists(p):
+            raise _pf.PlecsFileError(f"文件不存在：{p}")
+        return _pf.PlecsFile(p)
+
+    @mcp.tool()
+    def plecs_file_info(path: str, tree_depth: int = 1) -> str:
+        """
+        离线读取 `.plecs` 模型文件的概览。**纯离线**，不需要 PLECS 在运行。
+
+        用于：模型里到底有哪些组件、求解器/时长设置、InitializationCommands 内容、
+        顶层子系统结构。RPC 的 plecs.get 只回模型级参数、不给组件树，所以要列组件
+        只能走本工具。
+
+        Args:
+            path: .plecs 文件路径
+            tree_depth: 组件树展开层级（0=不展开，1=顶层，2=含子系统内一层）
+
+        Returns:
+            模型名/版本/求解器/时长、组件类型统计、组件树、顶层端口。
+        """
+        try:
+            f = _open_plecs(path)
+        except _pf.PlecsFileError as e:
+            return f"✗ {e}"
+
+        m = f.model
+        init = m.attrs.get("InitializationCommands", "")
+        out = [
+            f"✓ {os.path.basename(f.path)}（{len(f.lines)} 行，"
+            f"{f.path.stat().st_size / 1024:.0f} KB，换行 {f.newline!r}）",
+            f"  模型名：{m.attrs.get('Name', '?')}   版本：{m.attrs.get('Version', '?')}   "
+            f"CircuitModel：{m.attrs.get('CircuitModel', '?')}",
+            f"  时长：{m.attrs.get('TimeSpan', '?')} s   求解器：{m.attrs.get('Solver', '?')}   "
+            f"MaxStep：{m.attrs.get('MaxStep', '?')}",
+            f"  组件总数：{len(f.components())}",
+        ]
+        tc = f.type_counts()
+        if tc:
+            items = [f"{k}×{v}" for k, v in tc.items()]
+            line, buf = "  类型：", ""
+            for it in items:
+                if len(buf) + len(it) > 76:
+                    out.append(line + buf.rstrip("、"))
+                    line, buf = "        ", ""
+                buf += it + "、"
+            if buf:
+                out.append(line + buf.rstrip("、"))
+
+        if init:
+            first = [l for l in init.splitlines() if l.strip()][:3]
+            out.append(f"  InitCommands：{len(init.splitlines())} 行，前 3 行")
+            out += [f"      {l}" for l in first]
+            out.append(f"    （全文用 plecs_file_get(path=\"{path}\", block=\"@\", "
+                       f"var=\"InitializationCommands\"）")
+
+        if tree_depth > 0:
+            out.append(f"\n组件树（展开 {tree_depth} 层）：")
+            tree = _pf.render_tree(f, max_depth=tree_depth).splitlines()
+            out += ["  " + l for l in tree[:60]]
+            if len(tree) > 60:
+                out.append(f"  …（共 {len(tree)} 行，用 plecs_file_blocks 精确筛）")
+        return "\n".join(out)
+
+    @mcp.tool()
+    def plecs_file_blocks(path: str, query: str = "", kind: str = "",
+                          ports: bool = False, limit: int = 80) -> str:
+        """
+        离线列出 `.plecs` 里的组件（可按名称/类型筛），`ports=True` 时附端口表。
+
+        Args:
+            path:  .plecs 文件路径
+            query: 子串筛选，同时匹配名称与类型（不区分大小写）；留空 = 全部
+            kind:  类型精确筛选，如 "CScript"、"Subsystem"、"Resistor"
+            ports: True 时对每个命中组件展示端口（Subsystem 的 Terminal 或
+                   CScript 的 NumInputs/NumOutputs）
+            limit: 最多显示多少个（默认 80）
+
+        Returns:
+            组件清单：序号（可直接当选择器 `#N` 用）、名称、类型、位置。
+        """
+        try:
+            f = _open_plecs(path)
+        except _pf.PlecsFileError as e:
+            return f"✗ {e}"
+
+        comps = f.components()
+        q = query.strip().lower()
+        hit = []
+        for i, c in enumerate(comps, 1):
+            nm, ty = c.attrs.get("Name", ""), c.attrs.get("Type", "")
+            if kind and ty.lower() != kind.strip().lower():
+                continue
+            if q and q not in nm.lower() and q not in ty.lower():
+                continue
+            hit.append((i, c))
+
+        if not hit:
+            return (f"✗ 没有匹配的组件（query={query!r}, kind={kind!r}）\n"
+                    f"  模型共 {len(comps)} 个组件，类型："
+                    + "、".join(f"{k}×{v}" for k, v in f.type_counts().items()))
+
+        out = [f"✓ {os.path.basename(f.path)}：命中 {len(hit)} / {len(comps)} 个组件"
+               + (f"（只显示前 {limit}）" if len(hit) > limit else "")]
+        for i, c in hit[:limit]:
+            out.append(f"  #{i:<4} {c.attrs.get('Name', '?'):<22} "
+                       f"{c.attrs.get('Type', '?'):<20} {c.attrs.get('Position', '')}"
+                       + (f"  ⟵ {c.path}" if "/" in c.path else ""))
+            if ports:
+                for line in _pf.render_ports(c).splitlines():
+                    out.append("        " + line.strip())
+        if len(hit) > limit:
+            out.append(f"  …共 {len(hit)} 个，收窄 query/kind 或调大 limit")
+        return "\n".join(out)
+
+    @mcp.tool()
+    def plecs_file_get(path: str, block: str = "@", var: str = "",
+                       max_len: int = 400) -> str:
+        """
+        离线读取 `.plecs` 里某个块的参数值（C-Script 的 Declarations/Ts/Parameters、
+        模型级 TimeSpan/Solver、电阻电感值、InitializationCommands 等）。
+
+        Args:
+            path:    .plecs 文件路径
+            block:   块选择器：`@`=模型根；`#12`=第 12 个组件；
+                     名字（如 "环路控制"，唯一子串也行）；路径 `Sub1/Sub2`
+            var:     参数名（如 "Ts"、"Declarations"、"TimeSpan"）；留空=列全部
+            max_len: 单个值最多显示多少字符（长脚本会截断，给 0 表示全显示）
+
+        Returns:
+            参数表或单个参数的完整值。
+        """
+        try:
+            f = _open_plecs(path)
+            node, ps = f.get_param(block, var)
+        except _pf.PlecsFileError as e:
+            return f"✗ {e}"
+
+        title = node.attrs.get("Name") or node.key
+        ty = node.attrs.get("Type")
+        head = f"✓ {os.path.basename(f.path)} :: {title}" + (f"〔{ty}〕" if ty else "")
+        if var:
+            v = ps[var]
+            return f"{head}\n  {var} = {v if max_len <= 0 or len(v) <= max_len else v[:max_len] + f'…（共 {len(v)} 字）'}"
+        return head + "\n" + _pf.render_params(node, head=max_len)
+
+    @mcp.tool()
+    def plecs_file_set(path: str, block: str, var: str, value: str,
+                       dry_run: bool = False) -> str:
+        """
+        离线修改 `.plecs` 里的参数并写盘（**会改磁盘文件**，动前自动备份）。
+
+        只改目标那几行，其余字节不动（保留 CRLF/LF、缩进、列对齐、base64 分段）。
+        改完自动回读校验。
+
+        Args:
+            path:    .plecs 文件路径
+            block:   块选择器（同 plecs_file_get）：`@` / `#12` / 名字 / 路径
+            var:     参数名（如 "Ts"、"NumDiscStates"；模型级用 "TimeSpan"）
+            value:   新值文本。原文是 base64 的属性会自动重新 base64 编码，
+                     引号字符串会自动转义并重新分段
+            dry_run: True 只预览改动、不写盘
+
+        Returns:
+            改动前后对照 + 备份路径；失败时给出可用参数名。
+        """
+        try:
+            f = _open_plecs(path)
+        except _pf.PlecsFileError as e:
+            return f"✗ {e}"
+
+        try:
+            old, new = f.set_param(block, var, value)
+        except _pf.PlecsFileError as e:
+            return f"✗ {e}"
+
+        title = f.resolve(block).attrs.get("Name") or block
+        if old == new:
+            return f"✓ 已是目标值，未改动：{title} / {var} = {old}"
+        if dry_run:
+            return (f"（dry-run，未写盘）\n"
+                    f"  {title} / {var}\n   [改] {old[:200]}\n   →  {new[:200]}")
+
+        try:
+            bak = f.save()
+        except OSError as e:
+            return f"✗ 写盘失败：{e}"
+
+        # 回读校验
+        try:
+            back = _pf.PlecsFile(f.path).get_param(block, var)[1][var]
+            ok = back == new
+        except _pf.PlecsFileError as e:
+            return f"✗ 已写入但回读失败：{e}（备份：{bak}）"
+        if not ok:
+            return (f"✗ 回读不一致，请用备份恢复：{bak}\n"
+                    f"   期望：{new[:120]}\n   实际：{back[:120]}")
+
+        return (f"✓ 已改并回读校验通过\n"
+                f"  文件：{f.path}\n"
+                f"  块：{title} / {var}\n"
+                f"  [改] {old[:200]}\n"
+                f"   →  {new[:200]}\n"
+                f"  备份：{bak}\n"
+                f"  ⚠ 这是磁盘文件；PLECS 里若已打开该模型，需关闭重开才会加载新值")
 
     return mcp
 

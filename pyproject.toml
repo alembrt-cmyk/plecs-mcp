@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name            = "plecs-mcp"
-version         = "0.3.0"
+version         = "0.3.2"
 description     = "MCP Server for PLECS 4.7 Standalone"
 requires-python = ">=3.10"
 dependencies    = [
@@ -17,6 +17,15 @@ dev = ["pytest>=7.0", "pytest-mock>=3.0"]
 
 [project.scripts]
 plecs-mcp = "server:main"
+
+# 之前漏了这段 ⇒ 打出来的 whl 里一个 .py 都没有（只带了 buck48to12_outputs 的杂项）
+[tool.setuptools]
+py-modules = ["server", "plecs_client", "trace_reader", "plecs_file"]
+# 本项目没有包，只有 4 个顶层模块；显式清空，免得自动发现把杂物目录塞进 whl
+packages = []
+
+[tool.setuptools.data-files]
+"." = ["config.yml", "README.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

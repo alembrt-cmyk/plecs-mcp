@@ -624,3 +624,150 @@ class TestPlecsClient:
         c._proxy = mock_proxy
         c.close("BuckConverter")
         mock_proxy.plecs.close.assert_called_with("BuckConverter")
+
+# ── P0 回归：真实 statistics 字段 / load 语义 / MatFile / MIMO ─────────────
+
+REAL_MODELS = [
+    {"id": "lvrt", "filename": "C:/m/lvrt.plecs", "library": False,
+     "state": "idle", "age": "3s"},
+    {"id": "Components", "filename": "D:/PLECS/Components.plecs", "library": True,
+     "state": "idle", "age": "9s"},
+]
+
+
+class TestStatsRealShape:
+    """4.7.5 实测：models 条目无 simulating 键，状态在 state。"""
+
+    def test_derives_simulating_from_state(self):
+        from plecs_client import _norm_models
+        m = _norm_models([{"id": "M", "filename": "C:/m.plecs", "library": False,
+                           "state": "simulation running", "age": "0s"}])[0]
+        assert m["simulating"] is True
+        assert m["state"] == "simulation running"
+        assert m["filename"] == "C:/m.plecs"
+
+    def test_idle_not_simulating(self):
+        from plecs_client import _norm_models
+        m = _norm_models(REAL_MODELS)[0]
+        assert m["simulating"] is False
+
+    def test_close_refuses_by_state(self, tools, mock_client):
+        """state='simulation running' 且没有 simulating 键时也必须拒绝。"""
+        mock_client.statistics.return_value = {
+            "version": "4.7.5", "build": "x",
+            "models": [{"id": "lvrt", "filename": "C:/m/lvrt.plecs",
+                        "library": False, "state": "simulation running"}],
+        }
+        result = tools["plecs_close"](model_name="lvrt")
+        assert "✗" in result
+        assert "simulation running" in result
+        mock_client.close.assert_not_called()
+
+    def test_status_shows_running_from_state(self, tools, mock_client):
+        mock_client.statistics.return_value = {
+            "version": "4.7.5", "build": "x",
+            "models": [{"id": "lvrt", "filename": "C:/m/lvrt.plecs",
+                        "library": False, "state": "simulation running"}],
+        }
+        result = tools["plecs_status"]()
+        assert "仿真中" in result
+        assert "C:/m/lvrt.plecs" in result
+
+    def test_statistics_uses_separate_connection(self):
+        """statistics() 走独立连接：主连接不可用/被阻塞时也能查（长仿真期间的关键）。"""
+        c = PlecsClient()
+        main = MagicMock()
+        main.plecs.statistics.side_effect = RuntimeError("主连接被仿真占用")
+        stat = MagicMock()
+        stat.plecs.statistics.return_value = {"version": [4, 7, 5, "b"], "models": REAL_MODELS}
+        c._proxy = main
+        c._stat_proxy = stat
+        stats = c.statistics()
+        assert stats["version"] == "4.7.5"
+        assert stats["models"][0]["id"] == "lvrt"
+        main.plecs.statistics.assert_not_called()
+
+
+class TestLoadRealSemantics:
+    """4.7.5 实测：load 成功返回 0，真实模型名要从 statistics 反查。"""
+
+    def test_resolves_name_from_new_model(self):
+        c = PlecsClient()
+        proxy = MagicMock()
+        proxy.plecs.load.return_value = 0
+        proxy.plecs.statistics.side_effect = [
+            {"version": "4.7.5", "models": REAL_MODELS[:1]},
+            {"version": "4.7.5", "models": REAL_MODELS[:1] + [
+                {"id": "boost", "filename": "C:/m/boost.plecs",
+                 "library": False, "state": "idle"}]},
+        ]
+        c._proxy = proxy
+        c._stat_proxy = proxy
+        assert c.load("C:/m/boost.plecs") == "boost"
+
+    def test_matches_by_filename_when_reloading(self):
+        c = PlecsClient()
+        proxy = MagicMock()
+        proxy.plecs.load.return_value = 0
+        same = [{"id": "内部名", "filename": "C:/m/x.plecs", "library": False, "state": "idle"}]
+        proxy.plecs.statistics.side_effect = [
+            {"version": "4.7.5", "models": same},
+            {"version": "4.7.5", "models": same},
+        ]
+        c._proxy = proxy
+        c._stat_proxy = proxy
+        assert c.load("C:////m////x.plecs") == "内部名"
+
+    def test_falls_back_to_filename(self):
+        c = PlecsClient()
+        proxy = MagicMock()
+        proxy.plecs.load.return_value = 0
+        proxy.plecs.statistics.return_value = {"version": "4.7.5", "models": []}
+        c._proxy = proxy
+        c._stat_proxy = proxy
+        assert c.load("C:/m/none.plecs") == "none"
+
+
+class TestMatFileOutput:
+    """OutputFormat=MatFile 时 PLECS 把 MAT 二进制当返回值，不再 dict() 崩。"""
+
+    def test_client_wraps_binary(self):
+        c = PlecsClient()
+        proxy = MagicMock()
+        proxy.plecs.simulate.return_value = b"Binary MATLAB 5.0 MAT-file"
+        c._proxy = proxy
+        assert c.simulate("M", {"OutputFormat": "MatFile"})["_binary"].startswith(b"Binary")
+
+    def test_tool_writes_file(self, tools, mock_client, tmp_path):
+        mock_client.simulate.return_value = {"_binary": b"MATDATA" * 10}
+        target = tmp_path / "sub" / "out.mat"
+        result = tools["plecs_simulate"](
+            model_name="lvrt",
+            opts='{"OutputFormat": "MatFile"}',
+            save_mat=str(target),
+        )
+        assert target.read_bytes() == b"MATDATA" * 10
+        assert "已写盘" in result
+        assert str(target) in result
+
+    def test_tool_default_path(self, tools, mock_client, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        mock_client.simulate.return_value = {"_binary": b"XYZ"}
+        result = tools["plecs_simulate"](model_name="m1", opts='{"OutputFormat": "MatFile"}')
+        assert (tmp_path / "m1_result.mat").exists()
+        assert "m1_result.mat" in result
+
+
+class TestMimoAnalyze:
+    def test_all_channels_reported(self, tools, mock_client):
+        mock_client.analyze.return_value = {
+            "F": [100, 1000, 10000],
+            "Gr": [[10.0, 0.5, 0.1], [5.0, 0.2, 0.01]],   # 两行都在 0dB 有穿越
+            "Gi": [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+        }
+        result = tools["plecs_analyze"](
+            model_name="M", analysis_type="ACSweep", opts="{}"
+        )
+        assert "通道 2" in result
+        assert "输出通道：2 个" in result
+        assert result.count("穿越频率") == 2

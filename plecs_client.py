@@ -15,17 +15,26 @@ plecs_client.py  —  PLECS 4.7.x XML-RPC 客户端
     plecs.webserver      → webserver()
     plecs.codegen        → codegen()
 
-实测要点（4.7.5）：
-  - statistics().models 是 dict 列表：{id, library, simulating}（不是字符串）
+实测要点（4.7.5，2026-11-02 复测）：
+  - statistics().models 是 dict 列表：{id, filename, library, state, age}
+    ★ **没有 `simulating` 键**：仿真中 state == "simulation running"，空闲为 "idle"。
+    本模块统一派生 simulating 布尔量，并保留 filename/state。
+  - plecs.load 成功返回 0（int），文件不存在抛 Fault("File not found")
+    ⇒ 真实模型名需从 statistics 反查（见 load()）。
   - simulate/analyze 是**阻塞**命令，RPC 同时只允许一个阻塞命令
   - 仿真时长在 SolverOpts.TimeSpan（秒）；StopTime 已废弃
   - simulate 仅当模型顶层有 outport 时才返回 {Time, Values}，否则返回空
+  - OutputFormat="MatFile" 时 PLECS **不落盘**，直接把 MAT 二进制当返回值吐回来
+  - 同一个 ServerProxy 的 HTTP 连接不可并发（会 CannotSendRequest）；
+    但**不同连接可并发** —— 故 statistics() 走独立连接，仿真期间也能查状态
   - 仿真运行中绝不可 close
 """
 
 import http.client
 import logging
+import os
 import socket
+import threading
 import xmlrpc.client
 from typing import Any
 
@@ -51,18 +60,42 @@ class TimeoutTransport(xmlrpc.client.Transport):
 
 
 def _norm_models(models: Any) -> list[dict]:
-    """statistics().models 兼容处理：str 或 dict 条目统一为 {id, library, simulating}。"""
+    """statistics().models 归一化。
+
+    4.7.5 实测条目：{id, filename, library, state, age}，**无 simulating 键**；
+    仿真进行中 state == "simulation running"。
+    这里统一补齐 simulating（由 state/旧键推导）并保留 filename/state。
+    """
     out = []
     for m in models or []:
         if isinstance(m, dict):
+            state = str(m.get("state", "") or "")
+            sim = bool(m.get("simulating")) or ("running" in state.lower())
             out.append({
                 "id": str(m.get("id", "")),
+                "filename": str(m.get("filename", "") or ""),
                 "library": bool(m.get("library", False)),
-                "simulating": bool(m.get("simulating", False)),
+                "state": state,
+                "simulating": sim,
             })
         else:
-            out.append({"id": str(m), "library": False, "simulating": False})
+            out.append({"id": str(m), "filename": "", "library": False,
+                        "state": "", "simulating": False})
     return out
+
+
+def _norm_path(p: str) -> str:
+    """路径比较用归一化：统一分隔符 + 小写（Windows 不区分大小写）。"""
+    return os.path.normpath(str(p).replace("\\", "/")).replace("\\", "/").casefold()
+
+
+def _as_bytes(x: Any) -> bytes | None:
+    """XML-RPC 的 <base64> 会解码成 xmlrpc.client.Binary（不是 bytes），统一转 bytes。"""
+    if isinstance(x, xmlrpc.client.Binary):
+        return x.data
+    if isinstance(x, (bytes, bytearray)):
+        return bytes(x)
+    return None
 
 
 def _norm_stats(result: Any) -> dict:
@@ -91,6 +124,10 @@ class PlecsClient:
         self.long_timeout = long_timeout
         self._proxy: xmlrpc.client.ServerProxy | None = None
         self._proxy_long: xmlrpc.client.ServerProxy | None = None
+        # statistics 专用连接：与主连接分开，长仿真期间仍可查状态
+        self._stat_proxy: xmlrpc.client.ServerProxy | None = None
+        # 主连接串行锁：同一 ServerProxy 的 HTTP 连接不能并发（实测 CannotSendRequest）
+        self._lock = threading.RLock()
 
     # ── 连接 ─────────────────────────────────────────────────────────────
 
@@ -109,23 +146,27 @@ class PlecsClient:
         try:
             self._proxy = self._make_proxy(self.timeout)
             self._proxy_long = self._make_proxy(self.long_timeout)
+            self._stat_proxy = self._make_proxy(self.timeout)
             # 直连原始 proxy，避免经 _call 触发递归重连
             stats = _norm_stats(self._proxy.plecs.statistics())
             logger.info("已连接 PLECS %s @ %s:%d",
                         stats.get("version"), self.host, self.port)
             return stats
         except xmlrpc.client.Fault as e:
-            self._proxy = self._proxy_long = None
+            self._reset()
             raise PlecsError(f"plecs.statistics() 调用失败 — {e.faultString}") from e
         except (ConnectionRefusedError, socket.gaierror, OSError) as e:
-            self._proxy = self._proxy_long = None
+            self._reset()
             raise PlecsError(f"无法连接到 {self.host}:{self.port} — {e}") from e
+
+    def _reset(self) -> None:
+        self._proxy = self._proxy_long = self._stat_proxy = None
 
     def is_connected(self) -> bool:
         if self._proxy is None:
             return False
         try:
-            self._proxy.plecs.statistics()
+            self.statistics()
             return True
         except Exception:
             return False
@@ -133,6 +174,12 @@ class PlecsClient:
     # ── 调用核心（断连自动重连一次） ─────────────────────────────────────
 
     def _call(self, method: str, *args, long_op: bool = False) -> Any:
+        # 同一 ServerProxy 的 HTTP 连接不能并发，主连接一律串行；
+        # 需要仿真期间查状态 → 用 statistics()（走独立连接）
+        with self._lock:
+            return self._call_locked(method, *args, long_op=long_op)
+
+    def _call_locked(self, method: str, *args, long_op: bool = False) -> Any:
         if self._proxy is None:
             raise PlecsError("未连接到 PLECS，请先调用 plecs_connect")
         if long_op:
@@ -155,17 +202,18 @@ class PlecsClient:
             raise PlecsError(
                 f"[{method}] 超时（{'long_timeout' if long_op else 'timeout'}="
                 f"{self.long_timeout if long_op else self.timeout}s）。"
-                f"若仿真确实很长，用 SolverOpts.Timeout 放宽或增大环境变量 PLECS_TIMEOUT"
+                f"注意：超时只是本端放弃等待，PLECS 里该仿真可能仍在继续；"
+                f"先 plecs_status 确认 state，必要时用 SolverOpts.Timeout 或加大 PLECS_LONG_TIMEOUT"
             ) from e
         except (ConnectionRefusedError, ConnectionResetError, BrokenPipeError,
-                http.client.CannotSendRequest, http.client.RemoteDisconnected,
-                socket.gaierror, OSError) as e:
+                http.client.CannotSendRequest, http.client.ResponseNotReady,
+                http.client.RemoteDisconnected, socket.gaierror, OSError) as e:
             # 连接级故障：重建代理并重试一次
             logger.warning("连接故障（%s），尝试自动重连…", e)
             try:
                 self.connect()
             except PlecsError as e2:
-                self._proxy = self._proxy_long = None
+                self._reset()
                 raise PlecsError(f"连接已断开且自动重连失败：{e2}") from e2
             if long_op and self._proxy_long is not None:
                 proxy = self._proxy_long
@@ -178,9 +226,9 @@ class PlecsClient:
             except TimeoutError as e3:
                 raise PlecsError(f"[{method}] 超时：{e3}") from e3
             except (ConnectionRefusedError, ConnectionResetError, BrokenPipeError,
-                    http.client.CannotSendRequest, http.client.RemoteDisconnected,
-                    socket.gaierror, OSError) as e3:
-                self._proxy = self._proxy_long = None
+                    http.client.CannotSendRequest, http.client.ResponseNotReady,
+                    http.client.RemoteDisconnected, socket.gaierror, OSError) as e3:
+                self._reset()
                 raise PlecsError(f"连接已断开：{e3}") from e3
 
     # ── system.* ─────────────────────────────────────────────────────────
@@ -201,24 +249,69 @@ class PlecsClient:
 
         实测 4.7.5 返回字段：
             version   : list  [major, minor, patch, "hash build-date"]（非字符串！）
-            models    : list[dict]  每项 {id, library, simulating}
+            models    : list[dict]  每项 {id, filename, library, state, age}
+                        ★ 无 simulating 键；仿真中 state == "simulation running"
             numberOfOpenModels / numberOfRunningSimulations /
             numberOfRunningAnalyses / uptime
 
         返回归一化 dict：version/build 转为友好字符串（原值存 version_raw），
-        models 统一为 {id, library, simulating}。
+        models 统一为 {id, filename, library, state, simulating}。
+
+        ★ 走**独立连接**（_stat_proxy），因此长仿真阻塞主连接时仍可查状态。
         """
-        return _norm_stats(self._call("plecs.statistics"))
+        if self._proxy is None:
+            raise PlecsError("未连接到 PLECS，请先调用 plecs_connect")
+        p = self._stat_proxy if self._stat_proxy is not None else self._proxy
+        try:
+            return _norm_stats(p.plecs.statistics())
+        except xmlrpc.client.Fault as e:
+            raise PlecsError(f"[plecs.statistics] 失败：{e.faultString}") from e
+        except (ConnectionRefusedError, ConnectionResetError, BrokenPipeError,
+                http.client.CannotSendRequest, http.client.ResponseNotReady,
+                http.client.RemoteDisconnected, socket.gaierror, OSError, TimeoutError) as e:
+            # 状态连接失效 → 重建一次再试
+            try:
+                self._stat_proxy = self._make_proxy(self.timeout)
+                return _norm_stats(self._stat_proxy.plecs.statistics())
+            except Exception as e2:
+                raise PlecsError(f"[plecs.statistics] 连接失效且重建失败：{e2}") from e2
 
     # ── plecs.load / plecs.close ─────────────────────────────────────────
 
     def load(self, path: str) -> str:
         """
         plecs.load(mdlFileName) — 打开 .plecs 模型（绝对路径）。
-        返回模型名（= 文件名去扩展名）。
+
+        ★ 实测 4.7.5：**成功返回 0（int）**，文件不存在抛 Fault("File not found")。
+        故真实模型名必须从 statistics 反查：
+          1) 与 load 前相比新出现的 id
+          2) 新 id 查不到时，按 filename 路径匹配（处理重载同名模型）
+          3) 都失败才回落到「文件名去扩展名」
         """
+        before: set[str] = set()
+        try:
+            before = {m["id"] for m in self.statistics().get("models", [])}
+        except PlecsError:
+            pass
+
         result = self._call("plecs.load", path)
-        return str(result) if result else _name_from_path(path)
+
+        name = result.strip() if isinstance(result, str) else ""
+        if name and not name.lstrip("+-").isdigit():
+            return name
+
+        try:
+            models = self.statistics().get("models", [])
+        except PlecsError:
+            models = []
+        for m in models:
+            if m["id"] not in before:
+                return m["id"]
+        target = _norm_path(path)
+        for m in models:
+            if m.get("filename") and _norm_path(m["filename"]) == target:
+                return m["id"]
+        return _name_from_path(path)
 
     def close(self, model_name: str) -> None:
         """
@@ -258,13 +351,20 @@ class PlecsClient:
 
         opts 传 list[dict] 时走官方并行接口（多核分发），返回 list。
         返回：顶层有 outport 时 {Time, Values}；否则空（None/{}）。
+
+        ★ OutputFormat="MatFile" 时 PLECS **不写文件**，直接把 MAT 二进制当返回值
+          返回，这里包装成 {"_binary": bytes} 交给上层落盘（否则 dict(bytes) 会崩）。
         """
         if opts is None:
             result = self._call("plecs.simulate", model_name, long_op=True)
         else:
             result = self._call("plecs.simulate", model_name, opts, long_op=True)
         if isinstance(result, list):
-            return result
+            return [{"_binary": b} if (b := _as_bytes(r)) is not None else r
+                    for r in result]
+        blob = _as_bytes(result)
+        if blob is not None:
+            return {"_binary": blob}
         return dict(result) if result else {}
 
     # ── plecs.analyze ────────────────────────────────────────────────────
@@ -293,7 +393,11 @@ class PlecsClient:
         else:
             result = self._call("plecs.analyze", model_name, analysis_name, opts, long_op=True)
         if isinstance(result, list):
-            return result
+            return [{"_binary": b} if (b := _as_bytes(r)) is not None else r
+                    for r in result]
+        blob = _as_bytes(result)
+        if blob is not None:
+            return {"_binary": blob}
         return dict(result) if result else {}
 
     # ── plecs.scope ──────────────────────────────────────────────────────
